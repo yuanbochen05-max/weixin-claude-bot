@@ -1,0 +1,14 @@
+{
+  "name": "weixin-claude-bot",
+  "version": "1.0.0",
+  "description": "Claude 接入微信个人号，基于腾讯 iLink Bot API",
+  "type": "module",
+  "scripts": {
+    "start": "node bot.js",
+    "login": "node bot.js --login"
+  },
+  "dependencies": {
+"dotenv": "^16.4.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}

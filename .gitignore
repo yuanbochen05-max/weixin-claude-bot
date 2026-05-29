@@ -1,0 +1,6 @@
+node_modules/
+.env
+session.json
+*.zip
+gh_extract/
+tmp/
