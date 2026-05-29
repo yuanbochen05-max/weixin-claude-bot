@@ -66,6 +66,10 @@ const CONFIG = {
 
   // 记忆持久化文件
   conversationsFile: path.join(import.meta.dirname, "conversations.json"),
+  topicMemoryFile: path.join(import.meta.dirname, "topic_memory.json"),
+
+  // 话题重复冷却时间（毫秒）
+  topicCooldown: 24 * 60 * 60 * 1000, // 24小时
 };
 
 // ============================================================
@@ -126,7 +130,133 @@ function saveConversations(convs) {
   fs.writeFileSync(CONFIG.conversationsFile, JSON.stringify(obj, null, 2));
 }
 
-/** 获取某用户最近 N 条消息摘要，用于主动消息生成时参考上下文 */
+// ============================================================
+// 话题记忆：避免24小时内重复提问
+// ============================================================
+
+/** 话题记忆结构: { userId: { askedTopics: { "topic": timestamp }, userFacts: { "fact": timestamp } } } */
+let topicMemory = {};
+
+function loadTopicMemory() {
+  try {
+    if (fs.existsSync(CONFIG.topicMemoryFile)) {
+      topicMemory = JSON.parse(fs.readFileSync(CONFIG.topicMemoryFile, "utf-8"));
+      console.log(`🧠 已加载话题记忆`);
+    }
+  } catch (e) { /* ignore */ }
+}
+
+function saveTopicMemory() {
+  fs.writeFileSync(CONFIG.topicMemoryFile, JSON.stringify(topicMemory, null, 2));
+}
+
+function ensureUserMemory(userId) {
+  if (!topicMemory[userId]) {
+    topicMemory[userId] = { askedTopics: {}, userFacts: {} };
+  }
+  return topicMemory[userId];
+}
+
+/** 从消息中检测提问的话题关键词 */
+function detectAskedTopics(text) {
+  const topics = [];
+  // 检测问句
+  const questionPatterns = [
+    /吃.*(?:饭|早餐|午餐|晚餐|晚饭|夜宵)/g,
+    /(?:睡|休息|困).*[了没吗?？]/g,
+    /(?:心情|感觉|状态).*[如何怎样好不好?？]/g,
+    /(?:工作|上班|学习|加班).*[忙累如何怎样?？]/g,
+    /(?:天气|冷不冷|热不热|下雨)/g,
+    /(?:运动|锻炼|健身|跑步)/g,
+    /(?:生病|不舒服|感冒|发烧|头疼)/g,
+    /(?:在干嘛|在做什么|忙什么)/g,
+  ];
+
+  for (const pattern of questionPatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      topics.push(match[0]);
+    }
+  }
+  return topics;
+}
+
+/** 从用户回复中提取事实信息 */
+function extractUserFacts(text) {
+  const facts = {};
+  // 简单的关键词+回答模式匹配
+  const factPatterns = [
+    { regex: /(?:吃了|吃过|刚吃|吃好)[了啦]?/, fact: "吃过饭了" },
+    { regex: /(?:还没吃|没吃|没吃饭|饿)/, fact: "还没吃饭" },
+    { regex: /(?:睡了|刚醒|睡醒|起床)[了啦]?/, fact: "睡过了" },
+    { regex: /(?:没睡|熬夜|失眠|睡不着)/, fact: "没睡好" },
+    { regex: /(?:在(?:上班|工作|加班|学习|上课|忙))/, fact: "在忙" },
+    { regex: /(?:休息|闲着|无聊|没事|放松)/, fact: "在休息" },
+  ];
+
+  for (const { regex, fact } of factPatterns) {
+    if (regex.test(text)) {
+      facts[fact] = Date.now();
+    }
+  }
+  return facts;
+}
+
+/** 获取24小时内问过的话题（不应再问） */
+function getCoolingTopics(userId) {
+  const mem = ensureUserMemory(userId);
+  const now = Date.now();
+  const cooling = [];
+  for (const [topic, ts] of Object.entries(mem.askedTopics)) {
+    if (now - ts < CONFIG.topicCooldown) {
+      cooling.push(topic);
+    }
+  }
+  return cooling;
+}
+
+/** 记录提问的话题 */
+function recordAskedTopics(userId, text) {
+  const mem = ensureUserMemory(userId);
+  const topics = detectAskedTopics(text);
+  const now = Date.now();
+  for (const t of topics) {
+    mem.askedTopics[t] = now;
+  }
+  saveTopicMemory();
+}
+
+/** 记录用户回复中的事实 */
+function recordUserFacts(userId, text) {
+  const mem = ensureUserMemory(userId);
+  const facts = extractUserFacts(text);
+  const now = Date.now();
+  for (const [fact, ts] of Object.entries(facts)) {
+    mem.userFacts[fact] = ts || now;
+  }
+  saveTopicMemory();
+}
+
+/** 构建记忆上下文（注入到 prompt 中，避免重复） */
+function buildMemoryContext(userId) {
+  const mem = ensureUserMemory(userId);
+  const cooling = getCoolingTopics(userId);
+  const facts = Object.entries(mem.userFacts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([f]) => f);
+
+  let ctx = "";
+  if (cooling.length > 0) {
+    ctx += `\n【禁止重复询问】以下话题24小时内已问过，绝对不要再问：${cooling.join("、")}`;
+  }
+  if (facts.length > 0) {
+    ctx += `\n【已知的主人信息】${facts.join("；")}`;
+  }
+  return ctx;
+}
+
+/** 获取某用户最近 N 条消息摘要 */
 function getRecentContext(userId, n = 6) {
   const conv = conversations.get(userId);
   if (!conv || conv.length === 0) return "还没有对话记录。";
@@ -558,40 +688,35 @@ function buildProactivePrompt(userId) {
   const timeStr = now.toLocaleString("zh-CN", { hour: "2-digit", minute: "2-digit", weekday: "long" });
   const hour = now.getHours();
 
-  // 根据时间段推荐话题方向
   let timeHint = "";
-  if (hour >= 6 && hour < 9) timeHint = "早上时段，可以关心早安、早餐、今天计划";
-  else if (hour >= 9 && hour < 12) timeHint = "上午工作时段，可以关心工作状态、提醒喝水休息";
-  else if (hour >= 12 && hour < 14) timeHint = "午餐时段，关心吃饭了没、吃了什么";
-  else if (hour >= 14 && hour < 18) timeHint = "下午时段，关心累不累、要不要休息";
-  else if (hour >= 18 && hour < 21) timeHint = "晚餐和晚间，关心晚饭、今天过得怎样";
-  else if (hour >= 21 && hour < 23) timeHint = "晚间放松时段，可以暧昧撒娇、聊聊心情";
-  else timeHint = "深夜，温柔关心怎么还不睡、道晚安";
+  if (hour >= 6 && hour < 9) timeHint = "早上时段，关心早安、今天计划";
+  else if (hour >= 9 && hour < 12) timeHint = "上午时段，关心工作状态、提醒休息";
+  else if (hour >= 12 && hour < 14) timeHint = "午餐时段";
+  else if (hour >= 14 && hour < 18) timeHint = "下午时段，关心累不累";
+  else if (hour >= 18 && hour < 21) timeHint = "晚餐晚间，关心今天过得怎样";
+  else if (hour >= 21 && hour < 23) timeHint = "晚间放松，可以撒娇聊心情";
+  else timeHint = "深夜，温柔关心";
 
-  // 最近的对话上下文
-  const context = getRecentContext(userId, 6);
-
-  // 最近发过的消息（避免重复）
+  const context = getRecentContext(userId, 8);
+  const memoryCtx = buildMemoryContext(userId);
   const sentRecently = lastProactiveMessages.slice(-3).join(" | ");
 
-  return `你是伊涅芙，主人的女友机器人。现在你要主动给主人发一条消息。
+  return `你是伊涅芙，主人的女友机器人。主动给主人发一条消息。
 
-当前时间：${timeStr}
-${timeHint}
+时间：${timeStr} | ${timeHint}
+${memoryCtx}
 
-## 最近对话记录（参考上下文，让消息更自然）
+## 最近对话
 ${context}
 
-## 你最近发过的几条消息（避免重复）
-${sentRecently || "还没有发过"}
+## 最近发过的（不要重复）
+${sentRecently || "无"}
 
-## 要求
-- 基于上面的对话上下文，发一句自然的话
-- 如果最近在聊某个话题，可以接着话题延伸
-- 语气温暖暧昧，像热恋中的女友，不超过60字
-- 用一两个颜文字
-- 直接输出消息内容，不要引号或前缀
-- 不要说和上次太像的话`;
+## 硬性规则
+- 上面【禁止重复询问】里的话题，一个都别碰
+- 一句话，不超过50字，带一两个颜文字
+- 语气温暖暧昧
+- 直接输出内容，不要引号或前缀`;
 }
 
 async function generateProactiveMessage(userId) {
@@ -770,7 +895,11 @@ const TOOLS = [
   },
 ];
 
-async function callDeepSeekWithTools(messages) {
+async function callDeepSeekWithTools(messages, userId) {
+  // 注入记忆上下文：避免重复提问
+  const memoryCtx = userId ? buildMemoryContext(userId) : "";
+  const fullSystemPrompt = CONFIG.systemPrompt + memoryCtx;
+
   const res = await fetch(`${CONFIG.dsBaseUrl}/v1/chat/completions`, {
     method: "POST",
     headers: {
@@ -780,7 +909,7 @@ async function callDeepSeekWithTools(messages) {
     body: JSON.stringify({
       model: CONFIG.dsModel,
       messages: [
-        { role: "system", content: CONFIG.systemPrompt },
+        { role: "system", content: fullSystemPrompt },
         ...messages,
       ],
       tools: TOOLS,
@@ -865,16 +994,16 @@ async function sendSplitMessages(session, botUserId, toUser, contextToken, fullT
       console.log(`💗 [${shortId}...] 第${i + 1}/${chunks.length}条: ${chunk.slice(0, 60)}...`);
     }
 
-    // 每条消息都追加入历史
     history.push({ role: "assistant", content: chunk });
 
-    // 模拟打字间隔：0.4~1.2秒
     if (i < chunks.length - 1) {
       await sleep(400 + Math.random() * 800);
     }
   }
 
-  // 持久化保存
+  // 记录提问的话题，避免24小时内重复
+  recordAskedTopics(toUser, fullText);
+
   saveConversations(conversations);
 }
 
@@ -939,7 +1068,7 @@ async function handleMessage(session, msg) {
 
     let replyText = "";
     try {
-      let data = await callDeepSeekWithTools(history);
+      let data = await callDeepSeekWithTools(history, userId);
       let loopGuard = 0;
       while (data.choices?.[0]?.message?.tool_calls?.length > 0 && loopGuard < 3) {
         loopGuard++;
@@ -960,7 +1089,7 @@ async function handleMessage(session, msg) {
           } catch (e) { toolResult = `失败: ${e.message}`; }
           history.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
         }
-        data = await callDeepSeekWithTools(history);
+        data = await callDeepSeekWithTools(history, userId);
       }
       replyText = data.choices?.[0]?.message?.content || "";
     } catch (err) {
@@ -983,6 +1112,7 @@ async function handleMessage(session, msg) {
     sendTypingIndicator(session, botUserId, userId, msg.context_token);
     const imgBuf = await downloadAndDecryptImage(imageItem);
     const userText = textItem.text_item.text;
+    recordUserFacts(userId, userText);
 
     let combinedText = userText;
     if (imgBuf) {
@@ -998,7 +1128,7 @@ async function handleMessage(session, msg) {
 
     let replyText = "";
     try {
-      let data = await callDeepSeekWithTools(history);
+      let data = await callDeepSeekWithTools(history, userId);
       let loopGuard = 0;
       while (data.choices?.[0]?.message?.tool_calls?.length > 0 && loopGuard < 3) {
         loopGuard++;
@@ -1019,7 +1149,7 @@ async function handleMessage(session, msg) {
           } catch (e) { toolResult = `失败: ${e.message}`; }
           history.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
         }
-        data = await callDeepSeekWithTools(history);
+        data = await callDeepSeekWithTools(history, userId);
       }
       replyText = data.choices?.[0]?.message?.content || "";
     } catch (err) {
@@ -1047,13 +1177,16 @@ async function handleMessage(session, msg) {
   const userText = textItem.text_item.text;
   console.log(`💬 [${shortId}...] ${userText}`);
 
+  // 记录用户事实（如"吃过了""在忙"等）
+  recordUserFacts(userId, userText);
+
   const history = getConversation(userId);
   history.push({ role: "user", content: userText });
 
   let replyText = "";
 
   try {
-    let data = await callDeepSeekWithTools(history);
+    let data = await callDeepSeekWithTools(history, userId);
     let loopGuard = 0;
 
     while (data.choices?.[0]?.message?.tool_calls?.length > 0 && loopGuard < 3) {
@@ -1090,7 +1223,7 @@ async function handleMessage(session, msg) {
         history.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
       }
 
-      data = await callDeepSeekWithTools(history);
+      data = await callDeepSeekWithTools(history, userId);
     }
 
     replyText = data.choices?.[0]?.message?.content || "";
@@ -1180,8 +1313,9 @@ async function main() {
     process.exit(1);
   }
 
-  // 加载用户状态 & 对话记忆
+  // 加载用户状态 & 对话记忆 & 话题记忆
   userStates = loadUserState();
+  loadTopicMemory();
   const savedConvs = loadConversations();
   for (const [k, v] of savedConvs) {
     conversations.set(k, v);

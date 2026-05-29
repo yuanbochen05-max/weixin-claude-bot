@@ -3,6 +3,7 @@ node_modules/
 session.json
 conversations.json
 user_state.json
+topic_memory.json
 *.zip
 gh_extract/
 tmp/
