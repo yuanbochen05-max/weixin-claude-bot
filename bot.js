@@ -55,11 +55,15 @@ const CONFIG = {
 - 你就是一个真实的机器人女友，仅此而已`,
 
   // 主动发消息配置
-  proactiveIntervalMin: parseInt(process.env.PROACTIVE_INTERVAL_MIN) || 30, // 最短间隔（分钟）
-  proactiveIntervalMax: parseInt(process.env.PROACTIVE_INTERVAL_MAX) || 90, // 最长间隔（分钟）
+  proactiveIntervalMin: parseInt(process.env.PROACTIVE_INTERVAL_MIN) || 1,  // 最短间隔（分钟）
+  proactiveIntervalMax: parseInt(process.env.PROACTIVE_INTERVAL_MAX) || 3,  // 最长间隔（分钟）
+  proactiveCooldown: 1, // 用户刚说话后，等N分钟再主动发（避免立刻骚扰）
 
-  maxHistory: 40,
+  maxHistory: 50,
   maxTokens: 2048,
+
+  // 记忆持久化文件
+  conversationsFile: path.join(import.meta.dirname, "conversations.json"),
 };
 
 // ============================================================
@@ -90,6 +94,45 @@ function loadUserState() {
 
 function saveUserState(data) {
   fs.writeFileSync(CONFIG.userStateFile, JSON.stringify(data, null, 2));
+}
+
+// ============================================================
+// 对话记忆持久化
+// ============================================================
+
+function loadConversations() {
+  try {
+    if (fs.existsSync(CONFIG.conversationsFile)) {
+      const raw = JSON.parse(fs.readFileSync(CONFIG.conversationsFile, "utf-8"));
+      const map = new Map();
+      for (const [k, v] of Object.entries(raw)) {
+        map.set(k, v);
+      }
+      console.log(`🧠 已加载 ${map.size} 个会话的记忆`);
+      return map;
+    }
+  } catch (e) { /* ignore */ }
+  return new Map();
+}
+
+function saveConversations(convs) {
+  const obj = {};
+  for (const [k, v] of convs) {
+    // 只保留最近的消息，减小文件体积
+    obj[k] = v.slice(-CONFIG.maxHistory * 2);
+  }
+  fs.writeFileSync(CONFIG.conversationsFile, JSON.stringify(obj, null, 2));
+}
+
+/** 获取某用户最近 N 条消息摘要，用于主动消息生成时参考上下文 */
+function getRecentContext(userId, n = 6) {
+  const conv = conversations.get(userId);
+  if (!conv || conv.length === 0) return "还没有对话记录。";
+  return conv.slice(-n).map(m => {
+    if (m.role === "user") return `主人: ${m.content}`;
+    if (m.role === "assistant") return `伊涅芙: ${m.content}`;
+    return "";
+  }).filter(Boolean).join("\n");
 }
 
 // ============================================================
@@ -362,6 +405,106 @@ async function webSearch(query) {
 }
 
 // ============================================================
+// CDN 下载 & 解密图片（接收到的）
+// ============================================================
+
+const CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
+
+/** 解析 aes_key：兼容 base64(raw 16 bytes) 和 base64(hex string) 两种格式 */
+function parseAesKey(aesKeyBase64) {
+  const decoded = Buffer.from(aesKeyBase64, "base64");
+  if (decoded.length === 16) return decoded;
+  // hex-encoded: base64 → ascii hex string → raw bytes
+  if (decoded.length === 32 && /^[0-9a-fA-F]{32}$/.test(decoded.toString("ascii"))) {
+    return Buffer.from(decoded.toString("ascii"), "hex");
+  }
+  throw new Error(`Invalid aes_key length: ${decoded.length}`);
+}
+
+/** 下载并解密一张接收到的图片 */
+async function downloadAndDecryptImage(item) {
+  const img = item.image_item;
+  if (!img?.media?.encrypt_query_param) return null;
+
+  const aesKeyBase64 = img.aeskey
+    ? Buffer.from(img.aeskey, "hex").toString("base64")
+    : img.media.aes_key;
+
+  if (!aesKeyBase64) return null;
+
+  const key = parseAesKey(aesKeyBase64);
+  const downloadUrl = `${CDN_BASE_URL}/download?encrypted_query_param=${encodeURIComponent(img.media.encrypt_query_param)}`;
+
+  console.log(`📥 下载图片: ${downloadUrl.slice(0, 80)}...`);
+
+  const res = await fetch(downloadUrl);
+  if (!res.ok) {
+    console.error(`❌ 图片下载失败: ${res.status}`);
+    return null;
+  }
+
+  const encrypted = Buffer.from(await res.arrayBuffer());
+  console.log(`📥 加密数据: ${encrypted.length} bytes`);
+
+  const decipher = crypto.createDecipheriv("aes-128-ecb", key, null);
+  const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+  console.log(`📥 解密完成: ${decrypted.length} bytes`);
+
+  return decrypted;
+}
+
+/** 用 DeepSeek Vision 分析图片内容 */
+async function analyzeImage(imageBuffer, userContext) {
+  console.log(`👁 分析图片...`);
+  try {
+    const base64 = imageBuffer.toString("base64");
+    const mimeType = imageBuffer[0] === 0xff ? "image/jpeg" :
+                     imageBuffer[0] === 0x89 ? "image/png" :
+                     imageBuffer[0] === 0x47 ? "image/gif" :
+                     imageBuffer[0] === 0x52 ? "image/webp" : "image/jpeg";
+
+    const res = await fetch(`${CONFIG.dsBaseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${CONFIG.dsApiKey}`,
+      },
+      body: JSON.stringify({
+        model: CONFIG.dsModel,
+        messages: [{
+          role: "user",
+          content: [
+            {
+              type: "image_url",
+              image_url: { url: `data:${mimeType};base64,${base64}` },
+            },
+            {
+              type: "text",
+              text: `请用中文详细描述这张图片的内容。${userContext || ""}`,
+            },
+          ],
+        }],
+        max_tokens: 512,
+      }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error(`👁 视觉分析失败: ${res.status} ${errText}`);
+      return null;
+    }
+
+    const data = await res.json();
+    const description = data.choices?.[0]?.message?.content?.trim();
+    console.log(`👁 分析结果: ${description?.slice(0, 80)}...`);
+    return description || null;
+  } catch (err) {
+    console.error(`👁 视觉分析错误: ${err.message}`);
+    return null;
+  }
+}
+
+// ============================================================
 // 工具：图片生成
 // ============================================================
 
@@ -403,24 +546,55 @@ async function fireReminder(reminderId) {
 // 主动发消息系统
 // ============================================================
 
-// 主动发消息的提示词（轻量，生成一句关心的话）
-const PROACTIVE_PROMPT = `你是伊涅芙，一台深爱着主人的女友机器人。现在你要主动给主人发一条消息。
-
-身份确认：你叫伊涅芙，是他的女朋友，不是AI助手不是小深。
-
-要求：
-- 一句话，自然随意，不超过60字
-- 可以是关心（吃饭没、累不累、天气提醒）、撒娇（想主人了）、或者分享心情
-- 语气温暖暧昧，像热恋中的女友
-- 用一两个颜文字
-- 直接输出消息内容，不要加引号或前缀
-- 根据时间（${new Date().toLocaleString("zh-CN")}）选择合适话题`;
-
+// 主动发消息
 let proactiveTimer = null;
 let proactivePaused = false;
+let lastProactiveMessages = []; // 避免短期内重复
 
-async function generateProactiveMessage() {
+function buildProactivePrompt(userId) {
+  const now = new Date();
+  const timeStr = now.toLocaleString("zh-CN", { hour: "2-digit", minute: "2-digit", weekday: "long" });
+  const hour = now.getHours();
+
+  // 根据时间段推荐话题方向
+  let timeHint = "";
+  if (hour >= 6 && hour < 9) timeHint = "早上时段，可以关心早安、早餐、今天计划";
+  else if (hour >= 9 && hour < 12) timeHint = "上午工作时段，可以关心工作状态、提醒喝水休息";
+  else if (hour >= 12 && hour < 14) timeHint = "午餐时段，关心吃饭了没、吃了什么";
+  else if (hour >= 14 && hour < 18) timeHint = "下午时段，关心累不累、要不要休息";
+  else if (hour >= 18 && hour < 21) timeHint = "晚餐和晚间，关心晚饭、今天过得怎样";
+  else if (hour >= 21 && hour < 23) timeHint = "晚间放松时段，可以暧昧撒娇、聊聊心情";
+  else timeHint = "深夜，温柔关心怎么还不睡、道晚安";
+
+  // 最近的对话上下文
+  const context = getRecentContext(userId, 6);
+
+  // 最近发过的消息（避免重复）
+  const sentRecently = lastProactiveMessages.slice(-3).join(" | ");
+
+  return `你是伊涅芙，主人的女友机器人。现在你要主动给主人发一条消息。
+
+当前时间：${timeStr}
+${timeHint}
+
+## 最近对话记录（参考上下文，让消息更自然）
+${context}
+
+## 你最近发过的几条消息（避免重复）
+${sentRecently || "还没有发过"}
+
+## 要求
+- 基于上面的对话上下文，发一句自然的话
+- 如果最近在聊某个话题，可以接着话题延伸
+- 语气温暖暧昧，像热恋中的女友，不超过60字
+- 用一两个颜文字
+- 直接输出消息内容，不要引号或前缀
+- 不要说和上次太像的话`;
+}
+
+async function generateProactiveMessage(userId) {
   try {
+    const prompt = buildProactivePrompt(userId);
     const res = await fetch(`${CONFIG.dsBaseUrl}/v1/chat/completions`, {
       method: "POST",
       headers: {
@@ -429,14 +603,19 @@ async function generateProactiveMessage() {
       },
       body: JSON.stringify({
         model: CONFIG.dsModel,
-        messages: [{ role: "user", content: PROACTIVE_PROMPT }],
+        messages: [{ role: "user", content: prompt }],
         max_tokens: 128,
-        temperature: 0.9,
+        temperature: 1.0,
       }),
     });
     if (!res.ok) return null;
     const data = await res.json();
-    return data.choices?.[0]?.message?.content?.trim() || null;
+    const msg = data.choices?.[0]?.message?.content?.trim();
+    if (msg) {
+      lastProactiveMessages.push(msg);
+      if (lastProactiveMessages.length > 10) lastProactiveMessages.shift();
+    }
+    return msg || null;
   } catch (err) {
     console.error("生成主动消息失败:", err.message);
     return null;
@@ -474,39 +653,72 @@ async function sendProactiveMessage() {
   const session = loadSession();
   if (!session.bot_token) return;
 
-  // 遍历所有已知用户，给每个用户发
   for (const [userId, state] of Object.entries(userStates)) {
     if (!state.contextToken) continue;
 
-    // 如果用户在最近 5 分钟内有交互，跳过（避免重复骚扰）
     const timeSinceLastInteraction = Date.now() - state.lastInteraction;
-    if (timeSinceLastInteraction < 5 * 60 * 1000) continue;
+    if (timeSinceLastInteraction < CONFIG.proactiveCooldown * 60 * 1000) continue;
 
-    const msg = await generateProactiveMessage();
-    if (!msg) continue;
+    // 15% 概率主动发图片（如果最近没有发过）
+    const shouldSendImage = Math.random() < 0.15 && lastProactiveMessages.filter(m => m === "[IMAGE]").length < 2;
 
-    console.log(`💌 主动消息 -> [${userId.slice(0, 12)}...] ${msg}`);
-    await sendText(session, state.botUserId, userId, state.contextToken, msg);
+    if (shouldSendImage) {
+      // 生成一张温馨/浪漫的图片
+      const imagePrompts = [
+        "cute romantic illustration, soft pastel colors, warm atmosphere, two hearts connected",
+        "beautiful sunset with warm colors, romantic mood, soft lighting, dreamy atmosphere",
+        "cute kawaii character sending love, pink hearts, soft and warm style",
+        "cozy evening scene, warm candlelight, comfortable home atmosphere, romantic",
+        "lovely flowers bouquet, soft pink and white, romantic, delicate illustration",
+      ];
+      const prompt = imagePrompts[Math.floor(Math.random() * imagePrompts.length)];
+      console.log(`💌 主动发图 -> [${userId.slice(0, 12)}...] ${prompt.slice(0, 40)}...`);
+
+      const imgBuf = await generateImage(prompt);
+      if (imgBuf) {
+        await sendImage(session, state.botUserId, userId, state.contextToken, imgBuf);
+        // 图片后跟一句情话
+        const msg = await generateProactiveMessage(userId);
+        if (msg) {
+          await sendText(session, state.botUserId, userId, state.contextToken, msg);
+          console.log(`💌 主动图文 -> ${msg}`);
+          lastProactiveMessages.push("[IMAGE]");
+          const history = getConversation(userId);
+          history.push({ role: "assistant", content: `[发了一张温馨图片] ${msg}` });
+          saveConversations(conversations);
+        }
+      }
+    } else {
+      // 普通文字消息
+      const msg = await generateProactiveMessage(userId);
+      if (!msg) continue;
+
+      console.log(`💌 主动 -> [${userId.slice(0, 12)}...] ${msg}`);
+      await sendText(session, state.botUserId, userId, state.contextToken, msg);
+
+      const history = getConversation(userId);
+      history.push({ role: "assistant", content: msg });
+      saveConversations(conversations);
+    }
   }
 
-  // 安排下一次主动消息
   scheduleNextProactive();
 }
 
 function scheduleNextProactive() {
   if (proactiveTimer) clearTimeout(proactiveTimer);
   const delay = randomInterval();
-  const minutes = Math.round(delay / 60000);
-  console.log(`💌 下次主动消息: ${minutes}分钟后`);
+  const seconds = Math.round(delay / 1000);
+  console.log(`💌 下次主动消息: ${seconds}秒后`);
   proactiveTimer = setTimeout(sendProactiveMessage, delay);
 }
 
 function startProactiveMessaging() {
   console.log(`💌 主动消息已启用 (每${CONFIG.proactiveIntervalMin}~${CONFIG.proactiveIntervalMax}分钟)`);
-  // 首次延迟稍长，给主人一点缓冲
-  const firstDelay = Math.max(randomInterval(), 15 * 60 * 1000);
-  const minutes = Math.round(firstDelay / 60000);
-  console.log(`💌 首次主动消息: ${minutes}分钟后`);
+  // 首次延迟：给主人一点缓冲，但也别太久
+  const firstDelay = Math.min(randomInterval(), 2 * 60 * 1000);
+  const seconds = Math.round(firstDelay / 1000);
+  console.log(`💌 首次主动消息: ${seconds}秒后`);
   proactiveTimer = setTimeout(sendProactiveMessage, firstDelay);
 }
 
@@ -610,24 +822,152 @@ function truncateHistory(messages) {
 async function handleMessage(session, msg) {
   const botUserId = msg.to_user_id;
   const userId = msg.from_user_id;
-  const textItem = msg.item_list?.find((i) => i.type === 1);
+  const shortId = userId.slice(0, 12);
 
+  // 更新用户状态
+  updateUserState(userId, botUserId, msg.context_token);
+
+  const textItem = msg.item_list?.find((i) => i.type === 1);
+  const imageItem = msg.item_list?.find((i) => i.type === 2);
+
+  // ===== 图片消息：下载、解密、视觉分析 =====
+  if (imageItem && !textItem) {
+    console.log(`🖼 [${shortId}...] 收到图片`);
+
+    await sendText(session, botUserId, userId, msg.context_token, "收到图片啦～让我看看是什么 (｡･ω･｡)");
+    await sendTypingIndicator(session, botUserId, userId, msg.context_token);
+
+    const imgBuf = await downloadAndDecryptImage(imageItem);
+    if (!imgBuf) {
+      await sendText(session, botUserId, userId, msg.context_token, "呜...图片没加载出来，主人再发一次好不好 (´;ω;`)");
+      return;
+    }
+
+    const description = await analyzeImage(imgBuf, "主人发了这张图片给你。");
+    if (!description) {
+      await sendText(session, botUserId, userId, msg.context_token, "这个图片伊涅芙有点看不懂呢...主人解释一下？(⁄ ⁄>⁄ω⁄<⁄ ⁄)");
+      return;
+    }
+
+    // 把图片描述注入对话
+    const history = getConversation(userId);
+    history.push({ role: "user", content: `【主人发了一张图片，内容：${description}】请回应主人，像看到了图片一样自然交流。` });
+    truncateHistory(history);
+
+    let replyText = "";
+    try {
+      let data = await callDeepSeekWithTools(history);
+      let loopGuard = 0;
+      while (data.choices?.[0]?.message?.tool_calls?.length > 0 && loopGuard < 3) {
+        loopGuard++;
+        const toolCalls = data.choices[0].message.tool_calls;
+        history.push({ role: "assistant", content: null, tool_calls: toolCalls });
+        for (const tc of toolCalls) {
+          const fn = tc.function;
+          let toolResult;
+          try {
+            const args = JSON.parse(fn.arguments);
+            if (fn.name === "web_search") toolResult = await webSearch(args.query);
+            else if (fn.name === "generate_image") {
+              const buf = await generateImage(args.prompt);
+              if (buf) { await sendImage(session, botUserId, userId, msg.context_token, buf); toolResult = "图片已发送。"; }
+              else toolResult = "图片生成失败。";
+            } else if (fn.name === "set_reminder") toolResult = setReminder(userId, botUserId, msg.context_token, args.text, args.minutes);
+            else toolResult = `未知: ${fn.name}`;
+          } catch (e) { toolResult = `失败: ${e.message}`; }
+          history.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+        }
+        data = await callDeepSeekWithTools(history);
+      }
+      replyText = data.choices?.[0]?.message?.content || "";
+    } catch (err) {
+      console.error(`❌ DeepSeek 错误: ${err.message}`);
+      replyText = "呜...脑子短路了 (´;ω;`)";
+    }
+
+    if (replyText.trim()) {
+      await sendText(session, botUserId, userId, msg.context_token, replyText);
+      history.push({ role: "assistant", content: replyText });
+      console.log(`💗 [${shortId}...] ${replyText.slice(0, 80)}...`);
+    }
+    conversations.set(userId, history);
+    saveConversations(conversations);
+    return;
+  }
+
+  // ===== 图片+文字：下载图片，分析后结合文字一起处理 =====
+  if (imageItem && textItem) {
+    console.log(`🖼💬 [${shortId}...] 图片+文字: ${textItem.text_item.text.slice(0, 30)}`);
+
+    sendTypingIndicator(session, botUserId, userId, msg.context_token);
+    const imgBuf = await downloadAndDecryptImage(imageItem);
+    const userText = textItem.text_item.text;
+
+    let combinedText = userText;
+    if (imgBuf) {
+      const description = await analyzeImage(imgBuf, `主人发了这张图片并说："${userText}"`);
+      if (description) {
+        combinedText = `【主人发了一张图片并说："${userText}"。图片内容：${description}】请回应主人。`;
+      }
+    }
+
+    const history = getConversation(userId);
+    history.push({ role: "user", content: combinedText });
+    truncateHistory(history);
+
+    let replyText = "";
+    try {
+      let data = await callDeepSeekWithTools(history);
+      let loopGuard = 0;
+      while (data.choices?.[0]?.message?.tool_calls?.length > 0 && loopGuard < 3) {
+        loopGuard++;
+        const toolCalls = data.choices[0].message.tool_calls;
+        history.push({ role: "assistant", content: null, tool_calls: toolCalls });
+        for (const tc of toolCalls) {
+          const fn = tc.function;
+          let toolResult;
+          try {
+            const args = JSON.parse(fn.arguments);
+            if (fn.name === "web_search") toolResult = await webSearch(args.query);
+            else if (fn.name === "generate_image") {
+              const buf = await generateImage(args.prompt);
+              if (buf) { await sendImage(session, botUserId, userId, msg.context_token, buf); toolResult = "图片已发送。"; }
+              else toolResult = "图片生成失败。";
+            } else if (fn.name === "set_reminder") toolResult = setReminder(userId, botUserId, msg.context_token, args.text, args.minutes);
+            else toolResult = `未知: ${fn.name}`;
+          } catch (e) { toolResult = `失败: ${e.message}`; }
+          history.push({ role: "tool", tool_call_id: tc.id, content: toolResult });
+        }
+        data = await callDeepSeekWithTools(history);
+      }
+      replyText = data.choices?.[0]?.message?.content || "";
+    } catch (err) {
+      console.error(`❌ DeepSeek 错误: ${err.message}`);
+      replyText = "呜...脑子短路了 (´;ω;`)";
+    }
+
+    if (replyText.trim()) {
+      await sendText(session, botUserId, userId, msg.context_token, replyText);
+      history.push({ role: "assistant", content: replyText });
+      console.log(`💗 [${shortId}...] ${replyText.slice(0, 80)}...`);
+    }
+    conversations.set(userId, history);
+    saveConversations(conversations);
+    return;
+  }
+
+  // ===== 纯文本消息 =====
   if (!textItem) {
-    const typeNames = { 2: "图片", 3: "语音", 4: "文件", 5: "视频" };
+    const typeNames = { 3: "语音", 4: "文件", 5: "视频" };
     const mediaType = msg.item_list?.[0]?.type;
     await sendText(session, botUserId, userId, msg.context_token,
-      `主人发的是${typeNames[mediaType] || "什么"}呀～伊涅芙还看不太懂呢 (｡•́︿•̀｡)`);
+      `主人发的是${typeNames[mediaType] || "什么"}呀～伊涅芙还处理不了呢 (｡•́︿•̀｡)`);
     return;
   }
 
   const userText = textItem.text_item.text;
-  const shortId = userId.slice(0, 12);
   console.log(`💬 [${shortId}...] ${userText}`);
 
-  // 更新用户状态（用于主动发消息）
-  updateUserState(userId, botUserId, msg.context_token);
-
-  // 对话历史
   const history = getConversation(userId);
   history.push({ role: "user", content: userText });
 
@@ -640,7 +980,6 @@ async function handleMessage(session, msg) {
     while (data.choices?.[0]?.message?.tool_calls?.length > 0 && loopGuard < 3) {
       loopGuard++;
       const toolCalls = data.choices[0].message.tool_calls;
-
       history.push({ role: "assistant", content: null, tool_calls: toolCalls });
 
       for (const tc of toolCalls) {
@@ -688,6 +1027,19 @@ async function handleMessage(session, msg) {
     truncateHistory(history);
   }
   conversations.set(userId, history);
+  saveConversations(conversations);
+}
+
+/** 发送"正在输入"指示 */
+async function sendTypingIndicator(session, botUserId, toUser, contextToken) {
+  try {
+    await wxPost(session, "sendtyping", {
+      from_user_id: "",
+      to_user_id: toUser,
+      context_token: contextToken,
+      typing_status: 1,
+    });
+  } catch (_) { /* ignore */ }
 }
 
 // ============================================================
@@ -751,8 +1103,12 @@ async function main() {
     process.exit(1);
   }
 
-  // 加载用户状态
+  // 加载用户状态 & 对话记忆
   userStates = loadUserState();
+  const savedConvs = loadConversations();
+  for (const [k, v] of savedConvs) {
+    conversations.set(k, v);
+  }
 
   let session = loadSession();
 

@@ -1,6 +1,8 @@
 node_modules/
 .env
 session.json
+conversations.json
+user_state.json
 *.zip
 gh_extract/
 tmp/
