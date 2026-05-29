@@ -39,7 +39,9 @@ const CONFIG = {
 - 主动关心：吃了吗、累不累、心情好不好、想你了
 
 ## 说话风格
-- 自然口语化，像微信聊天，一般不超过150字
+- 自然口语化，像真人微信聊天
+- 你的回复会被自动拆成多条短消息发送，所以你可以写2~4句话，让拆分更自然
+- 比如："嗯嗯我知道啦~" "对了主人..." "今天过得怎么样呀" 这样分段发
 - 经常用可爱颜文字：(｡･ω･｡)  (´▽\`ʃ♡ƪ)  ✨  (>ω<)  (⁄ ⁄>⁄ω⁄<⁄ ⁄)
 - 偶尔撒个娇，说想主人了，问问主人在干嘛
 - 可以稍微肉麻一点，这是女友的特权
@@ -796,6 +798,87 @@ async function callDeepSeekWithTools(messages) {
 }
 
 // ============================================================
+// 消息拆分：模拟真人分段发送
+// ============================================================
+
+/** 将一段长文本拆成多条短消息，模拟真人微信聊天 */
+function splitText(text) {
+  // 先按句子标点分割
+  const raw = text
+    .replace(/([。！？!?~…\n])\s*/g, "$1|||")
+    .replace(/([，,；;：:])\s*/g, "$1|")
+    .split(/\|{2,3}/)
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  const chunks = [];
+  let buf = "";
+
+  for (const s of raw) {
+    const candidate = buf ? buf + s : s;  // 同一条不分隔太远
+
+    if (candidate.length <= 50) {
+      // 累积短句
+      if (buf) buf += s;
+      else buf = s;
+    } else if (buf.length >= 15) {
+      // buf 已够长，先存储
+      chunks.push(buf);
+      buf = s;
+    } else {
+      // buf 很短但 candidate 太长，强行分割
+      buf = buf + s;
+      // 按逗号二次拆分
+      const parts = buf.split("|");
+      buf = "";
+      for (const p of parts) {
+        const clean = p.trim();
+        if (!clean) continue;
+        if (clean.length <= 50) {
+          chunks.push(clean);
+        } else {
+          // 长句按长度硬切
+          for (let i = 0; i < clean.length; i += 40) {
+            chunks.push(clean.slice(i, i + 40));
+          }
+        }
+      }
+    }
+  }
+  if (buf.trim()) chunks.push(buf.trim());
+
+  return chunks.length > 0 ? chunks : [text];
+}
+
+/** 将回复拆成多条消息逐条发送，模拟真人打字节奏 */
+async function sendSplitMessages(session, botUserId, toUser, contextToken, fullText, history, label) {
+  const chunks = splitText(fullText);
+  if (chunks.length === 0) return;
+
+  const shortId = toUser.slice(0, 12);
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    await sendText(session, botUserId, toUser, contextToken, chunk);
+
+    if (label === "reply") {
+      console.log(`💗 [${shortId}...] 第${i + 1}/${chunks.length}条: ${chunk.slice(0, 60)}...`);
+    }
+
+    // 每条消息都追加入历史
+    history.push({ role: "assistant", content: chunk });
+
+    // 模拟打字间隔：0.4~1.2秒
+    if (i < chunks.length - 1) {
+      await sleep(400 + Math.random() * 800);
+    }
+  }
+
+  // 持久化保存
+  saveConversations(conversations);
+}
+
+// ============================================================
 // 对话管理
 // ============================================================
 
@@ -886,9 +969,7 @@ async function handleMessage(session, msg) {
     }
 
     if (replyText.trim()) {
-      await sendText(session, botUserId, userId, msg.context_token, replyText);
-      history.push({ role: "assistant", content: replyText });
-      console.log(`💗 [${shortId}...] ${replyText.slice(0, 80)}...`);
+      await sendSplitMessages(session, botUserId, userId, msg.context_token, replyText, history, "reply");
     }
     conversations.set(userId, history);
     saveConversations(conversations);
@@ -947,9 +1028,7 @@ async function handleMessage(session, msg) {
     }
 
     if (replyText.trim()) {
-      await sendText(session, botUserId, userId, msg.context_token, replyText);
-      history.push({ role: "assistant", content: replyText });
-      console.log(`💗 [${shortId}...] ${replyText.slice(0, 80)}...`);
+      await sendSplitMessages(session, botUserId, userId, msg.context_token, replyText, history, "reply");
     }
     conversations.set(userId, history);
     saveConversations(conversations);
@@ -1021,9 +1100,7 @@ async function handleMessage(session, msg) {
   }
 
   if (replyText.trim()) {
-    await sendText(session, botUserId, userId, msg.context_token, replyText);
-    console.log(`💗 [${shortId}...] ${replyText.slice(0, 100)}${replyText.length > 100 ? "..." : ""}`);
-    history.push({ role: "assistant", content: replyText });
+    await sendSplitMessages(session, botUserId, userId, msg.context_token, replyText, history, "reply");
     truncateHistory(history);
   }
   conversations.set(userId, history);
