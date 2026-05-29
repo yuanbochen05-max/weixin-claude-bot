@@ -360,7 +360,8 @@ async function webSearch(query) {
 
 async function generateImage(prompt) {
   console.log(`🎨 生成图片: ${prompt}`);
-  const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=512&height=512&nologo=true`;
+  // 1024x1024 高清，增强画质参数
+  const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=1024&height=1024&nologo=true&enhance=true`;
 
   const res = await fetch(url);
   if (!res.ok) {
