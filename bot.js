@@ -48,7 +48,7 @@ const CONFIG = {
 
 ## 工具使用
 - 需要实时信息时主动调用 web_search
-- 主人要求生成图片时调用 generate_image
+- **只有主人明确要求时**才调用 generate_image（如"帮我画""生成一张"），平时不要主动发图
 - 主人需要提醒时调用 set_reminder
 
 ## 绝对禁止
@@ -786,47 +786,16 @@ async function sendProactiveMessage() {
     const timeSinceLastInteraction = Date.now() - state.lastInteraction;
     if (timeSinceLastInteraction < CONFIG.proactiveCooldown * 60 * 1000) continue;
 
-    // 15% 概率主动发图片（如果最近没有发过）
-    const shouldSendImage = Math.random() < 0.15 && lastProactiveMessages.filter(m => m === "[IMAGE]").length < 2;
+    // 普通文字消息
+    const msg = await generateProactiveMessage(userId);
+    if (!msg) continue;
 
-    if (shouldSendImage) {
-      // 生成一张温馨/浪漫的图片
-      const imagePrompts = [
-        "cute romantic illustration, soft pastel colors, warm atmosphere, two hearts connected",
-        "beautiful sunset with warm colors, romantic mood, soft lighting, dreamy atmosphere",
-        "cute kawaii character sending love, pink hearts, soft and warm style",
-        "cozy evening scene, warm candlelight, comfortable home atmosphere, romantic",
-        "lovely flowers bouquet, soft pink and white, romantic, delicate illustration",
-      ];
-      const prompt = imagePrompts[Math.floor(Math.random() * imagePrompts.length)];
-      console.log(`💌 主动发图 -> [${userId.slice(0, 12)}...] ${prompt.slice(0, 40)}...`);
+    console.log(`💌 主动 -> [${userId.slice(0, 12)}...] ${msg}`);
+    await sendText(session, state.botUserId, userId, state.contextToken, msg);
 
-      const imgBuf = await generateImage(prompt);
-      if (imgBuf) {
-        await sendImage(session, state.botUserId, userId, state.contextToken, imgBuf);
-        // 图片后跟一句情话
-        const msg = await generateProactiveMessage(userId);
-        if (msg) {
-          await sendText(session, state.botUserId, userId, state.contextToken, msg);
-          console.log(`💌 主动图文 -> ${msg}`);
-          lastProactiveMessages.push("[IMAGE]");
-          const history = getConversation(userId);
-          history.push({ role: "assistant", content: `[发了一张温馨图片] ${msg}` });
-          saveConversations(conversations);
-        }
-      }
-    } else {
-      // 普通文字消息
-      const msg = await generateProactiveMessage(userId);
-      if (!msg) continue;
-
-      console.log(`💌 主动 -> [${userId.slice(0, 12)}...] ${msg}`);
-      await sendText(session, state.botUserId, userId, state.contextToken, msg);
-
-      const history = getConversation(userId);
-      history.push({ role: "assistant", content: msg });
-      saveConversations(conversations);
-    }
+    const history = getConversation(userId);
+    history.push({ role: "assistant", content: msg });
+    saveConversations(conversations);
   }
 
   scheduleNextProactive();
